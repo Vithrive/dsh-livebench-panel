@@ -1,0 +1,732 @@
+diff --git a/livebench/common.py b/livebench/common.py
+index 95373cc..a1297ea 100644
+--- a/livebench/common.py
++++ b/livebench/common.py
+@@ -126,7 +126,9 @@ def get_categories_tasks(bench_name: str):
+ 
+     else:
+         # specify a category or task
+-        category_name = split_bench_name[1].split('_')[0]
++        # dsh-livebench-panel patch: do NOT truncate category at "_" —
++        # split('_')[0] turned "data_analysis" into a nonexistent "data".
++        category_name = split_bench_name[1]
+ 
+         categories = {category_name: get_hf_dataset(category_name)}
+ 
+diff --git a/livebench/gen_api_answer.py b/livebench/gen_api_answer.py
+index 3c3308f..d2980a3 100644
+--- a/livebench/gen_api_answer.py
++++ b/livebench/gen_api_answer.py
+@@ -15,7 +15,16 @@ import shortuuid
+ import tqdm
+ 
+ from livebench.model.api_model_config import APIKwargs
+-from livebench.agentic_code_runner.minisweagent.run_inference import run_agentic_coding_inference
++
++try:
++    # Vendored mini-swe-agent uses `fcntl` (Unix-only); agentic coding tasks
++    # are therefore unavailable on Windows. Import lazily so other tasks work.
++    from livebench.agentic_code_runner.minisweagent.run_inference import (
++        run_agentic_coding_inference,
++    )
++except ImportError as _e:
++    run_agentic_coding_inference = None
++    _AGENTIC_IMPORT_ERROR = _e
+ 
+ from livebench.model.completions import API_ERROR_OUTPUT
+ from livebench.common import (
+diff --git a/livebench/lcb_runner/evaluation/compute_code_generation_metrics.py b/livebench/lcb_runner/evaluation/compute_code_generation_metrics.py
+index e6be21a..dcc6bbc 100644
+--- a/livebench/lcb_runner/evaluation/compute_code_generation_metrics.py
++++ b/livebench/lcb_runner/evaluation/compute_code_generation_metrics.py
+@@ -154,6 +154,27 @@ def evaluate_generations(
+     return results, metadata
+ 
+ 
++_pool_warmed = False
++
++
++def warm_process_pool():
++    """dsh-livebench-panel patch: on Windows (spawn), the first
++    ProcessPoolExecutor created from a non-main thread can hit the
++    'bootstrapping phase' race and break every evaluation. Warm the pool once
++    at process start so later per-question pools are stable."""
++    global _pool_warmed
++    if _pool_warmed:
++        return
++    _pool_warmed = True
++    try:
++        from concurrent.futures import ProcessPoolExecutor
++
++        with ProcessPoolExecutor(max_workers=1) as warm:
++            list(warm.map(abs, [1]))
++    except Exception:
++        pass
++
++
+ def codegen_metrics(
+     samples_list,
+     generations_list,
+@@ -162,6 +183,7 @@ def codegen_metrics(
+     timeout=6,
+     debug=False,
+ ):
++    warm_process_pool()
+ 
+     samples_linear = []
+     generations_linear = []
+diff --git a/livebench/lcb_runner/evaluation/testing_util.py b/livebench/lcb_runner/evaluation/testing_util.py
+index 4b83b70..01ecfec 100644
+--- a/livebench/lcb_runner/evaluation/testing_util.py
++++ b/livebench/lcb_runner/evaluation/testing_util.py
+@@ -10,6 +10,23 @@ from datetime import datetime
+ # to run the solution files we're using a timing based approach
+ import signal
+ 
++# dsh-livebench-panel patch: Windows has no SIGALRM/SIGALRM-based timing. Provide
++# no-op alarm + a fake signal registration so the generated runners work on
++# Windows; the process-level timeout in check_correctness still bounds runaway
++# code (p.join(timeout * n) + p.kill()).
++if not hasattr(signal, 'alarm') or not hasattr(signal, 'SIGALRM'):
++	def _no_alarm(_sec):
++		pass
++	signal.alarm = _no_alarm
++	if not hasattr(signal, 'SIGALRM'):
++		signal.SIGALRM = -2
++		_signal_original = signal.signal
++		def _signal_noop(sig, handler):
++			if sig == signal.SIGALRM:
++				return None
++			return _signal_original(sig, handler)
++		signal.signal = _signal_noop
++
+ import numpy as np
+ 
+ from io import StringIO
+@@ -482,7 +499,9 @@ def reliability_guard(maximum_memory_bytes=None):
+     with caution.
+     """
+ 
+-    if maximum_memory_bytes is not None:
++    if maximum_memory_bytes is not None and platform.uname().system == "Linux":
++        # dsh-livebench-panel patch: resource/setrlimit are Linux-only; skip
++        # the memory limits on Windows/macOS instead of crashing the runner.
+         import resource
+ 
+         resource.setrlimit(
+@@ -491,10 +510,9 @@ def reliability_guard(maximum_memory_bytes=None):
+         resource.setrlimit(
+             resource.RLIMIT_DATA, (maximum_memory_bytes, maximum_memory_bytes)
+         )
+-        if not platform.uname().system == "Darwin":
+-            resource.setrlimit(
+-                resource.RLIMIT_STACK, (maximum_memory_bytes, maximum_memory_bytes)
+-            )
++        resource.setrlimit(
++            resource.RLIMIT_STACK, (maximum_memory_bytes, maximum_memory_bytes)
++        )
+ 
+     faulthandler.disable()
+ 
+diff --git a/livebench/model/completions.py b/livebench/model/completions.py
+index 311cad1..d0b2ac1 100644
+--- a/livebench/model/completions.py
++++ b/livebench/model/completions.py
+@@ -1,5 +1,6 @@
+ import logging
+ import os
++import random
+ import sys
+ import time
+ import traceback
+@@ -41,17 +42,207 @@ def anthropic_api_key(model: str) -> str | None:
+ Conversation = list[dict[str, str]]
+ API_Kwargs = dict[str, str | float | int | dict[str, str] | None]
+ 
++
++# ---------------------------------------------------------------------------
++# 参数兼容层 (dsh-livebench-panel patch)
++#
++# 一些中转站 / 新模型会拒收个别请求参数并返回 4xx，例如：
++#   anthropic.BadRequestError: 400 `temperature` is deprecated for this model
++# LiveBench 原本把 temperature / max_tokens 等无条件塞进请求，撞上这类上游就整题
++# 记成 $ERROR$。这一层做通用降级：4xx 报错点名了哪个"已发送"的参数，就摘掉它重发，
++# 并把结果记进进程级缓存，之后同一 (上游, 模型) 的请求直接不再携带该参数。
++# 不硬编码参数名：temperature / top_p / reasoning_effort / thinking / max_tokens
++# 等都走同一套逻辑。
++# ---------------------------------------------------------------------------
++_PARAM_COMPAT_MAX_RETRIES = 4
++# 结构性字段：即使被报错点名也不能摘，摘了请求本身就不成立
++_PARAM_COMPAT_PROTECTED = frozenset({'model', 'messages', 'system', 'stream', 'stream_options'})
++# "这个参数不被接受"这类措辞。
++# 注意 "invalid / only ... allowed" 必须在内：aiportx 对 kimi-k3 的原文就是
++#   field Temperature invalid, only 1 is allowed for this model
++# 单看 "invalid" 会误伤值类错误，所以下面还要求参数名与措辞落在同一窗口内。
++_PARAM_REJECTION_CUES = (
++    'deprecated', 'not supported', 'unsupported', 'unknown', 'unrecognized',
++    'unexpected', 'does not support', "doesn't support", 'no longer', 'removed',
++    'invalid', 'not allowed', 'is not valid', 'only',
++    '不支持', '已废弃', '未知参数', '无效参数', '无效', '非法', '不允许', '只能',
++)
++# 参数名与拒绝措辞的最大间隔（字符）。值类错误如
++# "max_tokens: 32000 is greater than the model maximum of 8192" 不含上述措辞，
++# 因此不会被误判成"max_tokens 不被支持"而摘掉长度上限。
++_PARAM_CUE_WINDOW = 40
++# 只有这两个状态码才可能是"参数被拒"：400 Bad Request / 422 Unprocessable Entity。
++# 不能写成 400<=s<500 —— 401/403 的文案里也会出现 "invalid api key: temperature"
++# 这类字样，摘参数解决不了认证问题，只会掩盖真正的错误。
++_PARAM_COMPAT_STATUSES = frozenset({400, 422})
++_UNSUPPORTED_API_KWARGS: dict[str, set[str]] = {}
++
++
++def _error_status_code(exc: BaseException) -> int | None:
++    """Best-effort HTTP status from an SDK exception (anthropic / openai / httpx)."""
++    for attr in ('status_code', 'http_status', 'code'):
++        value = getattr(exc, attr, None)
++        if isinstance(value, int):
++            return value
++    response = getattr(exc, 'response', None)
++    value = getattr(response, 'status_code', None)
++    return value if isinstance(value, int) else None
++
++
++def _error_text(exc: BaseException) -> str:
++    """Error message plus response body, so a relay's own wording is searchable."""
++    parts = [str(exc)]
++    body = getattr(exc, 'body', None)
++    if body is not None:
++        parts.append(str(body))
++    response = getattr(exc, 'response', None)
++    if response is not None:
++        try:
++            parts.append(response.text)
++        except Exception:
++            pass
++    return ' '.join(parts)
++
++
++def blamed_api_kwarg(exc: BaseException, request_kwargs: dict[str, Any]) -> str | None:
++    """Return the sent parameter a 4xx error blames, else None.
++
++    Only 400/422 count. Attribution requires the parameter name and a rejection cue
++    to sit inside the same short window, so a value error such as
++    "max_tokens: 32000 is greater than the model maximum" is not mistaken for
++    "max_tokens is unsupported" (which would silently drop the length cap).
++    """
++    status = _error_status_code(exc)
++    if status not in _PARAM_COMPAT_STATUSES:
++        return None
++    text = _error_text(exc).lower()
++    candidates = [k for k in request_kwargs if k not in _PARAM_COMPAT_PROTECTED]
++    if not candidates:
++        return None
++    # 1) 被引号包裹的参数名是最可靠的信号：
++    #    "`temperature` is deprecated" / "'top_p' is not supported"
++    quoted = [n for n in candidates if any(f'{q}{n.lower()}{q}' in text for q in ('`', "'", '"'))]
++    if quoted:
++        return max(quoted, key=len)
++    # 2) 裸词：要求参数名与拒绝措辞落在同一窗口内（取最长匹配避免误伤）
++    hits: list[str] = []
++    for name in candidates:
++        low = name.lower()
++        start = text.find(low)
++        while start >= 0:
++            window = text[max(0, start - _PARAM_CUE_WINDOW): start + len(low) + _PARAM_CUE_WINDOW]
++            if any(cue in window for cue in _PARAM_REJECTION_CUES):
++                hits.append(name)
++                break
++            start = text.find(low, start + len(low))
++    return max(hits, key=len) if hits else None
++
++
++def unsupported_kwargs_for(scope: str) -> set[str]:
++    """Process-level memo of the parameters this (upstream, model) already refused."""
++    return _UNSUPPORTED_API_KWARGS.setdefault(scope, set())
++
++
++class APIRequestFailed(Exception):
++    """内层调用失败：带上 LiveBench 需要的错误元数据，往上抛给统一容错层。
++
++    容错层据此决定：摘参数重发 / 退避重试 / 直接记 $ERROR$。
++    """
++
++    def __init__(self, original: BaseException):
++        self.original = original
++        self.meta: dict[str, Any] = {
++            "eval_status": "api_error",
++            "error": original.__class__.__name__,
++            "error_msg": str(original)[:200],
++        }
++        super().__init__(str(original))
++
++
++# ---------------------------------------------------------------------------
++# 统一容错层 (dsh-livebench-panel patch)
++#
++# 一次评测要连续打几百次 API，任何一次"遇错即中断"都会让整题变 $ERROR$。
++# 所有 provider 的调用都过这一层，按顺序兜：
++#   1) 参数兼容：400/422 点名的参数摘掉重发（见上）；
++#   2) 瞬态错误：号池/限流/网关/网络，退避重试；
++#   3) 空答案：上游 200 但没内容，重发（多半是上游抖动）；
++#   4) 兜底：仍失败才返回 $ERROR$，并把错误写进 api_info 供排查。
++# ---------------------------------------------------------------------------
++_RESILIENCE_MAX_ATTEMPTS = 5
++_POOL_BACKOFF = (10, 30, 60, 120)
++_TRANSIENT_BACKOFF = (3, 8, 20, 40)
++# 上游 200 但内容为空时的重发次数与间隔（多半是上游抖动，重发通常就有内容）
++_EMPTY_ANSWER_RETRIES = 2
++_EMPTY_ANSWER_SLEEP = 3
++# 号池/限流：中转站"当前无可用资源"这类，需要等更久
++_POOL_ERROR_KEYS = (
++    "524", "522", "520", "无可用资源", "请稍后重试", "429",
++    "rate limit", "rate_limit", "too many requests", "overloaded",
++    "capacity", "no available", "quota exceeded", "temporarily unavailable",
++    "负载", "限流", "繁忙",
++)
++# 瞬态网络/网关：重试通常立刻就好
++_TRANSIENT_ERROR_KEYS = (
++    "timeout", "timed out", "connection", "reset", "disconnect", "eof",
++    "broken pipe", "incomplete", "502", "503", "504", "500", "408",
++    "bad gateway", "service unavailable", "gateway time", "internal server",
++    "server had an error", "remote protocol", "stream",
++)
++# "上游 200 但没给出可用内容"——这类值得重发，而不是直接判 0 分
++_EMPTY_ANSWER_KEYS = (
++    "no message returned", "no response from anthropic", "no response returned",
++    "api request failed", "empty response", "no content", "no choices",
++)
++_TRANSIENT_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524, 529})
++_POOL_STATUSES = frozenset({429, 520, 522, 524})
++
++
++def _is_pool_error(exc: BaseException) -> bool:
++    """号池/限流类：需要长退避。"""
++    if _error_status_code(exc) in _POOL_STATUSES:
++        return True
++    text = _error_text(exc).lower()
++    return any(k in text for k in _POOL_ERROR_KEYS)
++
++
++def _is_transient(exc: BaseException) -> bool:
++    """重试可能成功的错误。4xx（除 408/409/425/429）是客户端错误，重试无意义。"""
++    status = _error_status_code(exc)
++    if status is not None:
++        if status in _TRANSIENT_STATUSES:
++            return True
++        if 400 <= status < 500:
++            return False
++    text = _error_text(exc).lower()
++    return any(k in text for k in _POOL_ERROR_KEYS + _TRANSIENT_ERROR_KEYS)
++
++
++def _is_empty_answer_error(exc: BaseException) -> bool:
++    """上游返回成功但内容为空——重发通常能拿到东西。"""
++    text = str(exc).lower()
++    return any(k in text for k in _EMPTY_ANSWER_KEYS)
++
++
++def _answer_is_empty(output: Any) -> bool:
++    return not isinstance(output, str) or output.strip() == ""
++
++
+ class ModelAPI(Protocol):
+     def __call__(self, model: str, messages: Conversation, temperature: float, max_tokens: int, model_api_kwargs: API_Kwargs | None, api_dict: dict[str, str] | None, stream: bool) -> tuple[str, int, dict[str, Any] | None]:
+         ...
+ 
+ 
+ def retry_fail(retry_state):
+-    exception = retry_state.outcome.exception()
+-    error = exception.__class__.__name__ if exception else "Unknown"
+-    error_msg = str(exception)[:200] if exception else ""
+-    print(f"all retries failed: {error}: {error_msg}")
+-    return API_ERROR_OUTPUT, 0, {"eval_status": "api_error", "error": error, "error_msg": error_msg}
++    """tenacity 兜底回调：**不再把异常吞成 $ERROR$ 返回值**，而是抛出携带元数据的异常。
++
++    这是之前"一遇错就整题失败"的结构性根因：内层把异常吞掉以后，外层的
++    "瞬态重试 / 参数兼容"再也看不到错误，全部变成死代码。现在错误一路上抛，
++    由统一容错层决定重试、降级还是最终记 $ERROR$。
++    """
++    outcome = retry_state.outcome
++    exception = outcome.exception() if outcome is not None else None
++    raise APIRequestFailed(exception or RuntimeError("unknown API failure"))
+ 
+ 
+ def retry_log(retry_state):
+@@ -118,8 +309,11 @@ def chat_completion_openai(
+             num_tokens = None
+             input_tokens = None
+             cached_tokens = None
++            finish_reason = None
+             try:
+                 for chunk in stream:
++                    if chunk.choices and len(chunk.choices) > 0:
++                        finish_reason = getattr(chunk.choices[0], 'finish_reason', None) or finish_reason
+                     if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content is not None:
+                         message += chunk.choices[0].delta.content
+                     if chunk.choices and len(chunk.choices) > 0:
+@@ -146,14 +340,16 @@ def chat_completion_openai(
+             )
+             if response is None:
+                 raise Exception("No response returned from OpenAI")
+-            elif response.choices is None:
++            elif response.choices is None or len(response.choices) == 0:
++                # 有些中转站 200 + 空 choices（甚至带 error 字段），当成"空答案"重发而不是直接判 0
+                 print(response)
+-                raise Exception("API request failed")
++                raise Exception("No choices returned from OpenAI")
+             if isinstance(response.choices[0], str):
+                 message = response.choices[0]
+             else:
+                 message = response.choices[0].message.content
+                 reasoning_text = getattr(response.choices[0].message, 'reasoning_content', None) or ''
++            finish_reason = getattr(response.choices[0], 'finish_reason', None)
+             input_tokens = None
+             cached_tokens = None
+             if response.usage is not None:
+@@ -177,6 +373,11 @@ def chat_completion_openai(
+                 print(response)
+ 
+         if message is None or message == '':
++            if finish_reason == 'length':
++                # 推理模型把 max_tokens 全烧在思考上、正文为空：这是"真实的 0 分"，
++                # 不该重发浪费额度，也不该记成基础设施错误 $ERROR$。
++                logger.warning(f"Token exhaustion: model used all tokens, no content produced ({model})")
++                return "", (num_tokens if num_tokens is not None else -1), {'eval_status': 'token_exhaustion'}
+             raise Exception("No message returned from OpenAI")
+         if num_tokens is None:
+             num_tokens = -1
+@@ -527,12 +728,38 @@ def chat_completion_anthropic(model: str, messages: Conversation, temperature: f
+     if _needs_beta:
+         client = c.beta
+ 
+-    with client.messages.stream(
+-        model=model,
+-        messages=messages,
+-        system=system_message if system_message else NOT_GIVEN,
+-        **actual_api_kwargs
+-    ) as stream:
++    def _open_stream(kwargs: dict[str, Any]):
++        return client.messages.stream(
++            model=model,
++            messages=messages,
++            system=system_message if system_message else NOT_GIVEN,
++            **kwargs
++        )
++
++    # 参数兼容层：被 4xx 点名的"已发送"参数 -> 摘掉 + 记住 + 重发
++    unsupported = unsupported_kwargs_for(f"anthropic|{os.environ.get('ANTHROPIC_BASE_URL', '')}|{model}")
++    request_kwargs = {k: v for k, v in actual_api_kwargs.items() if k not in unsupported}
++    stream = None
++    for _compat_attempt in range(_PARAM_COMPAT_MAX_RETRIES + 1):
++        try:
++            # 真正发请求的是 MessageStreamManager.__enter__；400 在这里抛出，此时还
++            # 没有需要清理的 stream，所以可以安全地降级重试。
++            stream = _open_stream(request_kwargs).__enter__()
++            break
++        except Exception as exc:
++            blamed = blamed_api_kwarg(exc, request_kwargs)
++            if blamed is None:
++                raise
++            unsupported.add(blamed)
++            request_kwargs.pop(blamed, None)
++            logger.warning(
++                f"chat_completion_anthropic: {model} 拒绝了参数 `{blamed}`（{exc}）；"
++                f"已去掉该参数重发，后续请求也不再携带"
++            )
++    if stream is None:
++        raise Exception(f"chat_completion_anthropic: {model} 拒绝了所有参数组合")
++
++    with stream:
+         new_block = {}
+         fallback_model = None
+         for event in stream:
+@@ -576,8 +803,10 @@ def chat_completion_anthropic(model: str, messages: Conversation, temperature: f
+                     message.append(new_block)
+                 new_block = {}
+ 
+-    del actual_api_kwargs['max_tokens']
+-    del actual_api_kwargs['temperature']
++    # count_tokens 不接受 max_tokens/temperature；顺带排除降级时摘掉的参数
++    actual_api_kwargs = {
++        k: v for k, v in request_kwargs.items() if k not in ('max_tokens', 'temperature')
++    }
+ 
+     # The stream's final message carries exact usage (input from message_start,
+     # output from the final message_delta) — no extra API call needed.
+@@ -1006,25 +1235,200 @@ def chat_completion_litellm(
+     return message, num_tokens, metadata
+ 
+ 
++def _arg_get(args, kwargs, name, index, default=None):
++    """Read a call argument whether the caller passed it positionally or by keyword."""
++    if name in kwargs:
++        return kwargs[name]
++    if len(args) > index:
++        return args[index]
++    return default
++
++
++def _arg_set(args, kwargs, name, index, value):
++    """Write a call argument back in whichever form the caller used."""
++    if name in kwargs:
++        kwargs[name] = value
++        return args
++    if len(args) > index:
++        args = list(args)
++        args[index] = value
++    return args
++
++
++def _visible_params(args, kwargs) -> dict[str, Any]:
++    """本次请求真正会发出去的参数（None 表示已被省略，不参与归因）。"""
++    visible: dict[str, Any] = {}
++    for name, index in (('temperature', 2), ('max_tokens', 3)):
++        value = _arg_get(args, kwargs, name, index)
++        if value is not None:
++            visible[name] = value
++    extra = _arg_get(args, kwargs, 'model_api_kwargs', 4) or {}
++    visible.update({k: v for k, v in extra.items() if v is not None})
++    return visible
++
++
++def _drop_param(args, kwargs, name: str):
++    """把参数置 None 后返回新的 args：chat_completion_* 会把 None 映射成 NOT_GIVEN 从而省略它。"""
++    if name in ('temperature', 'max_tokens'):
++        args = _arg_set(args, kwargs, name, 2 if name == 'temperature' else 3, None)
++    extra = dict(_arg_get(args, kwargs, 'model_api_kwargs', 4) or {})
++    extra[name] = None
++    return _arg_set(args, kwargs, 'model_api_kwargs', 4, extra)
++
++
++def _scope_for(fn, api_base: str, model: str) -> str:
++    label = getattr(fn, '__name__', 'api').replace('chat_completion_', '') or 'api'
++    return f"{label}|{api_base}|{model}"
++
++
++def _unpack_result(result) -> tuple[Any, int, dict[str, Any] | None]:
++    """LiveBench 的 handler 有的返回 (text, tokens)，有的返回 (text, tokens, meta)。
++
++    gen_api_answer 用 `len(res) == 3` 区分，所以包装层必须**原样**返回同样的形状，
++    不能一律当成 3 元组 —— 之前就是这样把 chat_completion_openai_responses 打成了
++    `not enough values to unpack (expected 3, got 2)`。
++    """
++    if isinstance(result, tuple):
++        if len(result) >= 3:
++            return result[0], result[1], result[2]
++        if len(result) == 2:
++            return result[0], result[1], None
++        if len(result) == 1:
++            return result[0], -1, None
++    return result, -1, None
++
++
++def _pack_result(arity: int, output: Any, tokens: int, meta: dict[str, Any] | None):
++    if arity == 2:
++        return output, tokens
++    if arity == 1:
++        return output
++    return output, tokens, meta
++
++
++def _resilient_call(fn, args, kwargs, learned: dict[str, Any] | None = None) -> Any:
++    """统一容错层。
++
++    顺序：已知不支持参数预先摘除 → 400/422 点名参数则摘掉重发 →
++    瞬态/号池错误退避重试 → 空答案重发 → 仍失败才记 $ERROR$。
++    """
++    learned = learned if learned is not None else {}
++    model = _arg_get(args, kwargs, 'model', 0, '') or ''
++    api_dict = _arg_get(args, kwargs, 'api_dict', 5)
++    api_base = api_dict.get('api_base', '') if isinstance(api_dict, dict) else ''
++    if not api_base:
++        api_base = os.environ.get('ANTHROPIC_BASE_URL', '')
++    label = getattr(fn, '__name__', 'chat_completion')
++    unsupported = unsupported_kwargs_for(_scope_for(fn, api_base, model))
++    for name in list(unsupported):
++        args = _drop_param(args, kwargs, name)
++
++    dropped = 0
++    empty_retries = 0
++    last_error: BaseException | None = None
++
++    for attempt in range(1, _RESILIENCE_MAX_ATTEMPTS + 1):
++        try:
++            result = fn(*args, **kwargs)
++        except APIRequestFailed as failure:
++            last_error = failure.original
++        except Exception as unexpected:  # 内层没包到的异常也一并兜住
++            last_error = unexpected
++        else:
++            if isinstance(result, tuple):
++                learned['arity'] = len(result)   # 记住这个 handler 的真实返回形状
++            output, tokens, meta = _unpack_result(result)
++            arity = learned.get('arity', 3)
++            # 内层主动放弃（模型拒答等）或 token 耗尽——都是"真实结果"，不重试
++            if output == API_ERROR_OUTPUT or (meta or {}).get('eval_status') == 'token_exhaustion':
++                return _pack_result(arity, output, tokens, meta)
++            if _answer_is_empty(output) and empty_retries < _EMPTY_ANSWER_RETRIES:
++                empty_retries += 1
++                wait = _EMPTY_ANSWER_SLEEP * empty_retries
++                print(f"[dsh-livebench-panel] {label} 返回空答案，{wait}s 后重发"
++                      f"（第 {empty_retries}/{_EMPTY_ANSWER_RETRIES} 次）: {model}")
++                time.sleep(wait)
++                continue
++            return _pack_result(arity, output, tokens, meta)
++
++        # 失败分支：先看是不是参数被拒
++        blamed = blamed_api_kwarg(last_error, _visible_params(args, kwargs))
++        if blamed is not None and dropped < _PARAM_COMPAT_MAX_RETRIES:
++            dropped += 1
++            unsupported.add(blamed)
++            args = _drop_param(args, kwargs, blamed)
++            print(f"[dsh-livebench-panel] 上游拒绝了参数 `{blamed}`，去掉后重发"
++                  f"（后续请求不再携带）: {str(last_error)[:160]}")
++            continue
++
++        pool = _is_pool_error(last_error)
++        transient = pool or _is_transient(last_error)
++        empty_err = _is_empty_answer_error(last_error)
++        if attempt < _RESILIENCE_MAX_ATTEMPTS and (transient or empty_err):
++            if pool:
++                wait = _POOL_BACKOFF[min(attempt - 1, len(_POOL_BACKOFF) - 1)]
++            else:
++                wait = _TRANSIENT_BACKOFF[min(attempt - 1, len(_TRANSIENT_BACKOFF) - 1)]
++            if empty_err and not transient:
++                wait = min(wait, _EMPTY_ANSWER_SLEEP)
++            wait *= 1 + random.uniform(0, 0.2)
++            print(f"[dsh-livebench-panel] {label} 第 {attempt}/{_RESILIENCE_MAX_ATTEMPTS} 次失败"
++                  f"（{'号池' if pool else '瞬态'}），{wait:.0f}s 后重试: {str(last_error)[:140]}")
++            time.sleep(wait)
++            continue
++        break
++
++    error = last_error or RuntimeError("unknown API failure")
++    print(f"[dsh-livebench-panel] {label} 重试与降级均失败，本题记 $ERROR$: {str(error)[:200]}")
++    meta = {
++        "eval_status": "api_error",
++        "error": error.__class__.__name__,
++        "error_msg": str(error)[:200],
++    }
++    # 还没成功过一次时不知道 handler 的返回形状，默认按 3 元组返回：
++    # gen_api_answer 用 len(res) 分支，3 元组对两种 handler 都安全。
++    return _pack_result(learned.get('arity', 3), API_ERROR_OUTPUT, 0, meta)
++
++
++def _resilient(fn):
++    """把任意 chat_completion_* 包上统一容错层（参数兼容 + 重试 + 空答案重发）。
++
++    `learned` 记住该 handler 真实的返回元组长度（2 或 3）——注解不可信，
++    例如 chat_completion_anthropic 注解写的是 2 元组、实际返回 3 元组。
++    """
++
++    learned: dict[str, Any] = {}
++
++    def wrapped(*args, **kwargs):
++        return _resilient_call(fn, args, kwargs, learned)
++
++    wrapped.__name__ = getattr(fn, '__name__', 'chat_completion')
++    return wrapped
++
++
++# 兼容旧名字（早期只有 openai 通道走包装器）
++_openai_with_retry = _resilient(chat_completion_openai)
++
++
+ def get_api_function(provider_name: str, use_litellm: bool = False) -> ModelAPI:
++    """按 provider 取调用函数。
++
++    dsh-livebench-panel patch：**所有** provider 都要过统一容错层。以前只有字面量
++    'openai' 走包装器，而插件用的 URL provider（https://api.xxx/v1）和 'local'
++    都落到 else 分支的裸函数上，于是既没有参数兼容也没有重试 —— 一遇错就整题 $ERROR$。
++    """
+     if use_litellm:
+         from functools import partial
+         return partial(chat_completion_litellm, provider=provider_name)
+-    if provider_name == 'openai':
+-        return chat_completion_openai
+-    elif provider_name == 'openai_responses':
+-        return chat_completion_openai_responses
+-    elif provider_name == 'anthropic':
+-        return chat_completion_anthropic
+-    elif provider_name == 'mistral':
+-        return chat_completion_mistral
+-    elif provider_name == 'together':
+-        return chat_completion_together
+-    elif provider_name == 'google':
+-        return chat_completion_google_generativeai
+-    elif provider_name == 'aws':
+-        return chat_completion_aws
+-    elif provider_name == 'deepinfra':
+-        return chat_completion_deepinfra
+-    else:
+-        return chat_completion_openai
++    handler = {
++        'openai': chat_completion_openai,
++        'openai_responses': chat_completion_openai_responses,
++        'anthropic': chat_completion_anthropic,
++        'mistral': chat_completion_mistral,
++        'together': chat_completion_together,
++        'google': chat_completion_google_generativeai,
++        'aws': chat_completion_aws,
++        'deepinfra': chat_completion_deepinfra,
++    }.get(provider_name, chat_completion_openai)  # URL provider / 'local' 走 OpenAI 兼容协议
++    return _resilient(handler)
++
+diff --git a/livebench/process_results/coding/utils.py b/livebench/process_results/coding/utils.py
+index 883efc9..e5bcc5c 100644
+--- a/livebench/process_results/coding/utils.py
++++ b/livebench/process_results/coding/utils.py
+@@ -1,4 +1,9 @@
+-import fcntl
++try:
++    # fcntl is Unix-only; it is only used for agentic-eval cache file locking.
++    # Regular coding grading (LCB_generation / code_generation) does not need it.
++    import fcntl
++except ImportError:  # Windows
++    fcntl = None
+ import hashlib
+ import json
+ import os
+diff --git a/livebench/process_results/math/AMPS_Hard/utils.py b/livebench/process_results/math/AMPS_Hard/utils.py
+index 9bfb94e..44e832e 100644
+--- a/livebench/process_results/math/AMPS_Hard/utils.py
++++ b/livebench/process_results/math/AMPS_Hard/utils.py
+@@ -5,6 +5,7 @@ import multiprocessing.context
+ import os
+ import re
+ import signal
++import sys
+ import traceback
+ import warnings
+ from multiprocessing import Process, Queue
+@@ -29,6 +30,12 @@ please install lark via pip install lark",
+     )
+ 
+ def run_with_timeout(func, args=(), timeout=8):
++    if sys.platform == "win32":
++        # Windows: multiprocessing spawn cannot duplicate the pipe handle for
++        # this nested-function target (crashes the child, so every comparison
++        # silently fails). is_equiv is a fast sympy comparison — run it inline.
++        return func(*args)
++
+     def wrapper(queue):
+         try:
+             result = func(*args)
+diff --git a/livebench/run_livebench.py b/livebench/run_livebench.py
+index 1b27f1d..3fa5a7f 100644
+--- a/livebench/run_livebench.py
++++ b/livebench/run_livebench.py
+@@ -125,7 +125,12 @@ def run_command(cmd: str, env: dict[str, str] | None = None) -> int:
+     """Run a shell command and return its exit code"""
+     try:
+         print(f"Running: {cmd}")
+-        result = subprocess.run(["bash", "-c", cmd], env=env, check=True)
++        # Windows: use the native shell; ["bash", "-c", ...] may resolve to
++        # WSL/cygwin bash where the Windows venv PATH is meaningless.
++        if os.name == "nt":
++            result = subprocess.run(cmd, shell=True, env=env, check=True)
++        else:
++            result = subprocess.run(["bash", "-c", cmd], env=env, check=True)
+         return result.returncode
+     except subprocess.CalledProcessError as e:
+         print(f"Error running command: {cmd}")

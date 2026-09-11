@@ -43,8 +43,15 @@
 | 1 | 已知不支持参数**预先摘除** | 进程级缓存，后续请求直接不再携带 |
 | 2 | 400/422 点名参数 → **摘掉重发** | 见下节 |
 | 3 | 瞬态/号池错误 → **退避重试** | 号池 10/30/60/120s；瞬态 3/8/20/40s（带抖动），最多 5 次 |
-| 4 | 上游 200 但**内容为空** → **重发** | 最多 2 次（间隔 3/6s）；`choices` 为空、`content` 为空、流中途断开都算 |
+| 4 | 上游 200 但**内容为空** → **重发** | 最多 2 次（间隔 3/6s）；`choices` 为空、`content` 为空、流中断都算 |
 | 5 | 仍失败 → 记 `$ERROR$` | 错误原文写进 `api_info.error_msg`，便于排查 |
+
+**返回形状必须原样保留**（踩过的坑）：LiveBench 的 handler 有的返回 `(text, tokens)`、
+有的返回 `(text, tokens, meta)`，`gen_api_answer` 用 `len(res) == 3` 区分。
+包装层最初一律按 3 元组拆包，于是 `chat_completion_openai_responses`（2 元组）直接抛
+`not enough values to unpack (expected 3, got 2)`，整题 `$ERROR$`。
+现在按**运行时学习**到的真实元组长度原样返回 —— **不能信注解**：
+`chat_completion_anthropic` 的注解写的是 `tuple[str, int]`，实际返回 3 元组。
 
 **不重试的情况**（避免浪费额度和误判）：
 
@@ -90,22 +97,23 @@ anthropic / openai / openai_responses / URL provider 全部接入。
 ```bat
 cd /d <LiveBench 根目录>
 .venv\Scripts\python param_compat_selftest.py     :: 参数归因逻辑（16 条用例）
-.venv\Scripts\python resilience_matrix_test.py    :: 故障矩阵（19 个场景）
+.venv\Scripts\python resilience_matrix_test.py    :: 故障矩阵（25 个场景）
 ```
 
 `resilience_matrix_test.py` 用假客户端把"上游可能怎么坏"逐条演一遍（不联网、不消耗额度）：
 
 | 类别 | 场景 |
 |---|---|
-| 参数被拒 | 引号包裹的 `` `temperature` is deprecated ``、无引号的 `field Temperature invalid, only 1 is allowed`、anthropic 通道同款 |
+| 参数被拒 | 引号包裹的 `` `temperature` is deprecated ``、无引号的 `field Temperature invalid, only 1 is allowed`、anthropic 通道同款、`openai_responses` 通道同款 |
 | 值类错误 | `max_tokens greater than the model maximum` → 必须**不**摘参数、**不**重试 |
 | 认证 | 401 → 立即放弃（1 次调用，不重试不摘参数） |
 | 网关/号池 | 429 连撞两次、524 无可用资源、502 HTML 页面、连接重置、读超时 |
-| 响应异常 | 200 但 `choices` 为空数组、200 但 `content` 为空串、流中途断开 |
+| 响应异常 | 200 但 `choices` 为空数组、200 但 `content` 为空串、流中途断开、Responses 流没有 completed 事件 |
 | 应当放弃 | 持续 500 到上限、模型拒答 `invalid_prompt` |
 | 真实 0 分 | `finish_reason=length` + 空正文 → `token_exhaustion`，不重试 |
 | 记忆 | 参数只撞一次，第二题不再携带 |
-| 覆盖 | URL provider / `local` / anthropic 都必须走容错层 |
+| 覆盖 | URL provider / `local` / anthropic / `openai_responses` 都必须走容错层 |
+| 返回形状 | 2 元组 handler 原样返回、3 元组 handler 原样返回、未知形状时 3 元组且 `gen_api_answer` 两种拆包都能消费 |
 
 ## 打完补丁后的验收口径
 
