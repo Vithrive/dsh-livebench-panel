@@ -5,6 +5,18 @@
 
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.2.18] — 2026-09-11
+
+- **修复 provider 被悄悄换掉**：以前当 provider 既不是 anthropic/responses、且未选推理强度时，
+  面板不写自己的模型配置，并把**裸模型名**当 `--model` 传给 LiveBench。LiveBench 的
+  `get_model_config(裸名)` 会命中它自带的同名配置（例如 `kimi-k3` 命中 `moonshotai.yml`），
+  于是改用那份配置的 provider / `api_kwargs` / `max_tokens`。现在**每次都写自己的配置**，
+  `--model` **永远用 display-name**，解析结果确定为 `{local: <modelId>}` + `--api-base`。
+- 配套的 LiveBench 侧改动见
+  [docs/livebench-patches.md](docs/livebench-patches.md)：把"一遇错就整题 `$ERROR$`"改成
+  统一容错层（参数兼容 + 瞬态退避重试 + 空答案重发），并覆盖**所有** provider
+  （此前 URL provider 与 `local` 走的是裸函数，根本没有重试）。
+
 ## [0.2.17] — 2026-09-11
 
 - 补充 `repository` / `bugs` / `homepage` 元数据，npm 页面可直接跳转本仓库。
@@ -38,6 +50,7 @@
   - 正在评测中的模型会被跳过，并在响应 `skipped` 中返回，前端弹窗提示。
 - 顺带清理了数据目录中 67 个 0 字节 `*.jsonl`。
 
+[0.2.18]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.17...v0.2.18
 [0.2.17]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.16...v0.2.17
 [0.2.16]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.15...v0.2.16
 [0.2.15]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.14...v0.2.15
