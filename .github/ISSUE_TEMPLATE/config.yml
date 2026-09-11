@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 📖 先读：LiveBench 本地补丁说明
+    url: https://github.com/Vithrive/dsh-livebench-panel/blob/main/docs/livebench-patches.md
+    about: 面板依赖若干 LiveBench 本地补丁（Windows 兼容 + 上游参数兼容），很多报错源于漏打补丁。
+  - name: 💬 使用问题与经验交流
+    url: https://github.com/Vithrive/dsh-livebench-panel/discussions
+    about: 安装求助、配置分享、成绩对比等非缺陷类讨论请走 Discussions。

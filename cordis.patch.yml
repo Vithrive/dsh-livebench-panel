@@ -1,0 +1,12 @@
+# dsh-livebench-panel bundle patch: mounts the plugin row into the profile
+# layer stack. The browser half registers a "LiveBench" tab into the
+# Trajectory view (slot conversation.view, id "livebench", order 20 — right
+# of 对话 at order 0 and 轨迹 at order 10); the node half registers the
+# /dsh-livebench-panel/api/* routes that spawn LiveBench runs.
+#
+# Install (local dev, per ~/.dsh/AGENTS.md):
+#   profile package.json: "dsh-livebench-panel": "link:../../plugins/dsh-livebench-panel"
+#   + add "dsh-livebench-panel" to dsh.profile.bundles, then restart dsh web.
+- insert:
+    - id: dsh-livebench-panel
+      name: dsh-livebench-panel

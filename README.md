@@ -1,0 +1,129 @@
+# dsh-livebench-panel
+
+[![npm version](https://img.shields.io/npm/v/dsh-livebench-panel.svg)](https://www.npmjs.com/package/dsh-livebench-panel)
+[![npm downloads](https://img.shields.io/npm/dm/dsh-livebench-panel.svg)](https://www.npmjs.com/package/dsh-livebench-panel)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+DSH web 插件：在 **Trajectory 视图（轨迹视图）** 的「对话 / 轨迹」标签右侧新增一个 **LiveBench** 标签页。点进去即可用下拉框选择参数，直接对本机 LiveBench 发起评测并查看成绩。
+
+> 💬 使用问题、配置分享、成绩对比 → [Discussions](https://github.com/Vithrive/dsh-livebench-panel/discussions)；
+> 缺陷与功能建议 → [Issues](https://github.com/Vithrive/dsh-livebench-panel/issues)。
+> 遇到报错请先看 [LiveBench 本地补丁说明](docs/livebench-patches.md)，多数问题源于漏打补丁。
+
+## ⚠️ 依赖要求（必读）
+
+本插件只是**控制台**，真正的评测由 [LiveBench](https://github.com/LiveBench/LiveBench) 项目在本机完成。仅安装插件时，面板底部会显示同样的安装指引。完整安装步骤（Windows，约 10–20 分钟）：
+
+```bat
+:: 1) 克隆 LiveBench（放到默认路径可免配置；装在其它目录请设环境变量 DSH_LIVEBENCH_HOME 指向它）
+git clone https://github.com/LiveBench/LiveBench V:\PythonProject\C_UtilizeSpace\LiveBench
+
+:: 2) 用 Python 3.11 建虚拟环境并安装（3.10 会因 litellm 报 NotRequired 错误）
+cd /d V:\PythonProject\C_UtilizeSpace\LiveBench
+py -3.11 -m venv .venv
+.venv\Scripts\python -m pip install -e .
+
+:: 3) 仅评测 coding 类需要：安装评分依赖（较大，含 TensorFlow）
+.venv\Scripts\python -m pip install -r livebench\code_runner\requirements_eval.txt
+
+:: 4) 下载题目数据（约 250MB）
+cd livebench
+..\.venv\Scripts\python download_questions.py
+
+:: 5) 重启 dsh web，回到面板点「刷新」
+```
+
+装在其它目录时：设置**系统环境变量** `DSH_LIVEBENCH_HOME=<你的LiveBench目录>`，重启 dsh web 生效。
+
+## 面板选项说明
+
+| 选项 | 含义 | 选择建议 |
+|---|---|---|
+| 模型 | harness 全部 provider 的全部模型（含内置 deepseek-official）；分组展示 | 首次验证选小任务 + 便宜模型 |
+| 推理强度 | 该模型的 reasoning effort（无配置则禁用）；编码进条目名，不同强度独立出分 | 日常 `medium`/`high`；对比测试固定同一档 |
+| 题集 release | LiveBench 题目发布批次 | 公开题目最全的是 `2024-11-25`（推荐） |
+| 分类 | 六大类：coding / math / reasoning / language / data_analysis / instruction_following | 首次验证选 `language` |
+| 任务 | 分类下的具体任务（如 language/typos 拼写纠错） | 首次验证选 `typos`（短平快） |
+| 题目序号范围 | 该任务题目的起止下标（0 起，**含首尾**） | 冒烟测试填 0–1（只跑 2 题） |
+| max-tokens | 单次回答的 token 上限 | 推理模型给 8192+，否则思考被截断判 0 分 |
+
+## 功能
+
+- **标签页位置**：`conversation.view` 槽位 `id: "livebench"`、`order: 20`（对话 = 0，轨迹 = 10，LiveBench 排最右）。
+- **模型下拉框**：读取 `$DSH_HOME/settings.yaml` 的 `llm-pi-ai.providers` **并合并内置 `deepseek-official` 路由**（`@deepseek-ai/dsh-llm-deepseek` 注册的 DeepSeek-V4-Flash / V4-Pro / V4-Flash-Vision-Exp，默认 `https://api.deepseek.com` + `DEEPSEEK_API_KEY`，用户 `llm-deepseek` 设置节可覆盖），与 harness 模型选择同源，展示**全部 provider / 全部模型**；`openai-completions` 且配置了 `baseURL` 的 provider 会被标记为可直连 LiveBench（`--api-base` 路由）。
+- **推理强度下拉框**（模型右侧）：来自模型配置的 `reasoningEfforts` 映射（如 gpt-5.6 系 off/low/medium/high/xhigh/max，DeepSeek off/low/high/max）。选定后：
+  - 插件向 `livebench/model/model_configs/dsh_panel_generated__<display-name>.yaml` 写入一条模型配置（每个模型一个文件，避免并发写同名文件互相覆盖），经 LiveBench 的 `api_kwargs.default.reasoning_effort` 透传给 API（`off` 表示不透传、由后端走默认）；
+  - 强度编码进 display-name（如 `code-gpt__gpt-5.6-sol@high`），**不同强度在成绩表中是独立条目**，可直接对比。
+- **参数下拉框**：题集 release（LiveBench 全部 releases）、分类（coding/math/reasoning/language/data_analysis/instruction_following）、任务（随分类联动）、题目序号范围、max-tokens。
+- **运行控制**：开始 / 停止 / 刷新；最多 9 个模型并发评测（每个模型同时只跑 1 次）；实时滚动日志（每 2.5s 轮询）；「刷新」会清掉已结束的运行日志。
+- **成绩表**：直接读取 `data/live_bench/**/model_judgment/ground_truth_judgment.jsonl` 计算 模型 × 任务 平均分（分数 = 正确率 ×100，单元格下方括号标注「**本次没做或没做完的题数 / 用户选择的题数**」，即题目序号范围的题数；不参与正确率计算的总题数不展示），无需等 LiveBench 自己出榜。支持按模型名/时间排序、拖 ⠿ 自定义行序、勾选或单行按钮删除成绩（删除会同时清掉该模型的答案与判分行；只有空壳文件的“幽灵行”不会再被扫描出来，删除结果稳定持久）。
+- **题目序号范围按闭区间处理**：LiveBench 的 `--question-end` 是开区间（`questions[begin:end]`），面板按用户直觉采用闭区间（传参时 `止 + 1`），因此界面上填的题数与实际跑的题数一致。
+
+## 依赖
+
+- 本机 LiveBench 检出：默认 `V:\PythonProject\C_UtilizeSpace\LiveBench`，可用环境变量 `DSH_LIVEBENCH_HOME` 覆盖。
+- 已配置好的评测 venv：`<root>\.venv\Scripts\python.exe`（Python 3.11，`pip install -e .` 完成）。
+- API Key：从 harness provider 的 `apiKeyEnv` 环境变量解析，经 `LIVEBENCH_API_KEY` 传给 LiveBench，**不会**出现在命令行或浏览器响应里。
+
+## API（同源）
+
+| 路由 | 方法 | 说明 |
+|---|---|---|
+| `/dsh-livebench-panel/api/config` | GET | 可用性、releases、分类→任务表、providers+models |
+| `/dsh-livebench-panel/api/start` | POST | 启动一次 `run_livebench.py` |
+| `/dsh-livebench-panel/api/status` | GET | 运行状态 + 日志尾部 |
+| `/dsh-livebench-panel/api/stop` | POST | 终止当前评测 |
+| `/dsh-livebench-panel/api/results` | GET | 汇总成绩行 |
+| `/dsh-livebench-panel/api/delete` | POST | 删除指定 模型×分类×任务 的答案与判分记录（正文 `{rows:[{model,category,task}]}`；正在评测的模型会被跳过并在 `skipped` 中返回） |
+| `/dsh-livebench-panel/api/clear` | POST | 清掉已结束的运行日志/记录 |
+| `/dsh-livebench-panel/api/home` | POST | 保存 LiveBench 检出路径 |
+
+## 安装
+
+### 方式 A：从 npm 安装（推荐）
+
+```bash
+dsh plugin --profile web add dsh-livebench-panel
+```
+
+### 方式 B：从本仓库安装
+
+```bash
+git clone https://github.com/Vithrive/dsh-livebench-panel.git ~/.dsh/plugins/dsh-livebench-panel
+```
+
+然后在 `~/.dsh/profiles/web/package.json` 中：
+
+1. `dependencies` 加入 `"dsh-livebench-panel": "link:../../plugins/dsh-livebench-panel"`；
+2. `dsh.profile.bundles` 数组加入 `"dsh-livebench-panel"`。
+
+最后在 profile 目录执行 `pnpm install`，重启 `dsh web`，打开任一会话的轨迹视图即可看到 **LiveBench** 标签。
+
+## 开发
+
+提交前跑一遍自检（语法 + 插件声明 + npm 打包内容白名单，与 CI 口径一致）：
+
+```bash
+node scripts/check.mjs
+```
+
+仓库结构：
+
+```
+lib/index.js            node 半：/dsh-livebench-panel/api/* 路由，spawn run_livebench.py
+lib/client.js           浏览器半：注册 conversation.view 槽位的 LiveBench 标签
+cordis.patch.yml        把插件行插入 profile 的 bundle 层
+scripts/check.mjs       本地自检（语法 / 插件声明 / 打包白名单）
+docs/livebench-patches.md  依赖的 LiveBench 本地补丁（Windows + 中转站兼容）
+smoke.mjs               开发期冒烟脚本（不进 npm 包）
+```
+
+## 交流与反馈
+
+- **Bug / 功能建议**：[Issues](https://github.com/Vithrive/dsh-livebench-panel/issues)（有对应模板）
+- **使用问题 / 配置分享 / 成绩对比**：[Discussions](https://github.com/Vithrive/dsh-livebench-panel/discussions)
+- 提交 Issue 时请附：插件版本、系统与 Node/Python 版本、复现用的 release + 任务 + 题号范围 + provider/模型、以及完整日志（记得打码 API Key 和私有域名）。
+
+## License
+
+[MIT](LICENSE) © 2026 cszr (Vithrive)

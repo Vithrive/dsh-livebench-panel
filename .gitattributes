@@ -1,0 +1,15 @@
+# 统一换行风格：仓库内按文本处理，Windows 检出时自动转换
+* text=auto
+
+*.js    text
+*.mjs   text
+*.json  text
+*.yml   text
+*.yaml  text
+*.md    text
+
+*.tgz   binary
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.ico   binary

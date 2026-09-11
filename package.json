@@ -1,0 +1,52 @@
+{
+  "name": "dsh-livebench-panel",
+  "version": "0.2.17",
+  "description": "DSH web plugin: a LiveBench tab in the Trajectory view (right of 对话/轨迹). Run LiveBench evaluations against every model configured in the DeepSeek Harness — pick provider/model, category, task, release and question range from dropdowns, watch progress, and read scores in place.",
+  "license": "MIT",
+  "author": "cszr (Vithrive)",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Vithrive/dsh-livebench-panel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Vithrive/dsh-livebench-panel/issues"
+  },
+  "homepage": "https://github.com/Vithrive/dsh-livebench-panel#readme",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "livebench",
+    "benchmark",
+    "evaluation"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}
