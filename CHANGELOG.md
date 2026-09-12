@@ -5,6 +5,18 @@
 
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.2.23] — 2026-09-12
+
+- **修复「空字符串范围被当成 0..0」**：面板表单没填起止时提交的是 `""` 而不是 `null`，
+  旧代码只判 `!== null/undefined`，于是 `Number("") === 0`，范围被当成 `0..0` ——
+  只检查第 0 题，导致「没做出来的题号」显示为空、而括号里却写着 5 题没做出来。
+  现在 `""` 与 `null` 一律视为"未设范围"；写入元数据时也把空串规范化成 `null`。
+- 「没做出来的题号」的定义收紧为**没有有效答案**的题：压根没跑、跑了但空答案
+  （思考吃满 max-tokens）、跑了但 API 失败，三类都算——它们都该出分母，也都是要补跑的题。
+- Baseline 且未设范围时，「选择题数」恒等于题库大小（不再随已答题数变化）。
+- 老运行的元数据没有 `baselineIds` 时，可从 `baseline / baselineTask / baselinePicks`
+  反查还原（`baselineIdsFor`），历史行也能列出缺失题号。
+
 ## [0.2.22] — 2026-09-12
 
 - **Baseline 行现在会列出「没做出来的题号」**。编号是该题库内的 0 起下标，与
@@ -95,6 +107,7 @@
   - 正在评测中的模型会被跳过，并在响应 `skipped` 中返回，前端弹窗提示。
 - 顺带清理了数据目录中 67 个 0 字节 `*.jsonl`。
 
+[0.2.23]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.22...v0.2.23
 [0.2.22]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.21...v0.2.22
 [0.2.21]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.20...v0.2.21
 [0.2.20]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.18...v0.2.20

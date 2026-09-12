@@ -190,6 +190,11 @@ await check("Baseline 没做出来的题号", async () => {
   if (JSON.stringify(all) !== JSON.stringify([1, 3, 5, 7])) {
     throw new Error(`全量应为 [1,3,5,7]，实际 ${JSON.stringify(all)}`);
   }
+  // 空字符串范围必须等同于"未设范围"（否则 Number("") === 0，范围变成 0..0）
+  const emptyStr = mod.missingBaselineIndexes({ baselineIds: ids, begin: "", end: "" }, seen);
+  if (JSON.stringify(emptyStr) !== JSON.stringify([1, 3, 5, 7])) {
+    throw new Error(`空串范围应等同未设，应为 [1,3,5,7]，实际 ${JSON.stringify(emptyStr)}`);
+  }
   // 越界范围：基准仍是 8，题号仍落在 0-7
   const over = mod.missingBaselineIndexes({ baselineIds: ids, begin: 0, end: 1000 }, seen);
   if (JSON.stringify(over) !== JSON.stringify([1, 3, 5, 7])) {
@@ -211,7 +216,31 @@ await check("Baseline 没做出来的题号", async () => {
   // 非 baseline 运行返回 null
   const na = mod.missingBaselineIndexes({ begin: 0, end: 3 }, seen);
   if (na !== null) throw new Error(`非 baseline 应返回 null，实际 ${JSON.stringify(na)}`);
-  return "6 条用例";
+  // 老元数据（没有 baselineIds）应能从 baseline/baselineTask/baselinePicks 反查
+  const legacySeen = new Set(["placeholder"]);
+  const legacy = mod.missingBaselineIndexes(
+    { baseline: "glm53flash", baselineTask: "live_bench/math/olympiad", baselinePicks: ["failed"], begin: null, end: null },
+    legacySeen);
+  // 一个 id 都不匹配 → 8 题全部算没做出来，编号 0-7
+  if (!Array.isArray(legacy) || legacy.length !== 8 || legacy[0] !== 0 || legacy[7] !== 7) {
+    throw new Error(`老元数据应反查出 8 题、编号 0-7，实际 ${JSON.stringify(legacy)}`);
+  }
+  // 把第 0 题的 id 塞进 seen：老元数据反查出的列表必须与 baselineIds 一致，
+  // 否则编号会错位（这正是"整列都显示没做出来"的原因）
+  const idsOfLegacy = mod.baselineIdsFor
+    ? mod.baselineIdsFor({ baseline: "glm53flash", baselineTask: "live_bench/math/olympiad", baselinePicks: ["failed"] })
+    : null;
+  if (!Array.isArray(idsOfLegacy) || idsOfLegacy.length !== 8) {
+    throw new Error(`baselineIdsFor 应反查出 8 个 id，实际 ${JSON.stringify(idsOfLegacy && idsOfLegacy.length)}`);
+  }
+  const partialSeen = new Set([idsOfLegacy[0], idsOfLegacy[4]]);
+  const legacyPartial = mod.missingBaselineIndexes(
+    { baseline: "glm53flash", baselineTask: "live_bench/math/olympiad", baselinePicks: ["failed"], begin: null, end: null },
+    partialSeen);
+  if (JSON.stringify(legacyPartial) !== JSON.stringify([1, 2, 3, 5, 6, 7])) {
+    throw new Error(`老元数据部分完成应为 [1,2,3,5,6,7]，实际 ${JSON.stringify(legacyPartial)}`);
+  }
+  return "8 条用例";
 });
 
 const failed = results.filter((r) => !r.ok);
