@@ -1,6 +1,6 @@
 {
   "name": "dsh-livebench-panel",
-  "version": "0.2.21",
+  "version": "0.2.22",
   "description": "DSH web plugin: a LiveBench tab in the Trajectory view (right of 对话/轨迹). Run LiveBench evaluations against every model configured in the DeepSeek Harness — pick provider/model, category, task, release and question range from dropdowns, watch progress, and read scores in place. Ships a Baseline probe set built from the questions a reference model cannot solve.",
   "license": "MIT",
   "author": "cszr (Vithrive)",

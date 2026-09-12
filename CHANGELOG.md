@@ -5,6 +5,16 @@
 
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.2.22] — 2026-09-12
+
+- **Baseline 行现在会列出「没做出来的题号」**。编号是该题库内的 0 起下标，与
+  「题目序号范围」的编号一致，可以直接复制去重跑（例如只补跑 `3`）。
+  悬停在分数格上即可看到。
+- 题号计算同样按**题库实际题数**裁剪：8 题的题库填 `0-1000`，基准仍是 8，
+  题号只可能落在 `0-7`，不会按 1001 去编号。
+- 新增回归测试：`clampedRangeLength` 覆盖 `0-1000` / `-5-1000` 等越界输入；
+  `missingBaselineIndexes` 覆盖全量 / 越界范围 / 部分范围 / 尾部越界 / 全做出来 / 非 baseline。
+
 ## [0.2.21] — 2026-09-12
 
 - **修复正确率分母：没做出来的题不再算作"做错"**。推理模型在难题上会把 `max_tokens`
@@ -85,6 +95,7 @@
   - 正在评测中的模型会被跳过，并在响应 `skipped` 中返回，前端弹窗提示。
 - 顺带清理了数据目录中 67 个 0 字节 `*.jsonl`。
 
+[0.2.22]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.21...v0.2.22
 [0.2.21]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.20...v0.2.21
 [0.2.20]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.18...v0.2.20
 [0.2.18]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.17...v0.2.18

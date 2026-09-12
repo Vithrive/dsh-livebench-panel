@@ -82,6 +82,8 @@ const statsCases = [
   ["题库 8 题，范围 0-2", 8, 0, 2, 3],
   ["题库 8 题，范围 6-9（尾部越界）应截断为 2", 8, 6, 9, 2],
   ["题库 8 题，范围 0-100 应截断为 8", 8, 0, 100, 8],
+  ["题库 8 题，范围 0-1000 应截断为 8（不是 1001）", 8, 0, 1000, 8],
+  ["题库 8 题，范围 -5 到 1000 应截断为 8", 8, -5, 1000, 8],
   ["题库 36 题，范围 0-35（正好全量）", 36, 0, 35, 36],
   ["题库 36 题，范围 30-40（尾部越界）", 36, 30, 40, 6],
   ["题库 36 题，范围 40-50（整体越界）应为 0", 36, 40, 50, 0],
@@ -171,6 +173,45 @@ await check("空答案识别（正确率分母回归）", async () => {
   if (done !== 1) throw new Error(`做出来应为 1，实际 ${done}`);
   if (Math.round(score * 10) / 10 !== 91.7) throw new Error(`正确率应为 91.7%，实际 ${score}`);
   return `${emptyCases.length} 条 + 口径 1 条`;
+});
+
+// ---------------------------------------------------------------------------
+// 回归测试：Baseline「没做出来的题号」
+//
+// 编号必须是该题库内的 0 起下标（与「题目序号范围」一致），且范围先按题库实际题数裁剪：
+// 8 题的题库填 0-1000 时，基准是 8 而不是 1001，题号也只能落在 0-7。
+// ---------------------------------------------------------------------------
+await check("Baseline 没做出来的题号", async () => {
+  const mod = await import(pathToFileURL(resolve(ROOT, "lib/index.js")).href);
+  const ids = ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"];
+  const seen = new Set(["a0", "a2", "a4", "a6"]); // 1、3、5、7 没做出来
+
+  const all = mod.missingBaselineIndexes({ baselineIds: ids, begin: null, end: null }, seen);
+  if (JSON.stringify(all) !== JSON.stringify([1, 3, 5, 7])) {
+    throw new Error(`全量应为 [1,3,5,7]，实际 ${JSON.stringify(all)}`);
+  }
+  // 越界范围：基准仍是 8，题号仍落在 0-7
+  const over = mod.missingBaselineIndexes({ baselineIds: ids, begin: 0, end: 1000 }, seen);
+  if (JSON.stringify(over) !== JSON.stringify([1, 3, 5, 7])) {
+    throw new Error(`0-1000 应为 [1,3,5,7]，实际 ${JSON.stringify(over)}`);
+  }
+  // 只跑 0-3：缺 1、3
+  const part = mod.missingBaselineIndexes({ baselineIds: ids, begin: 0, end: 3 }, seen);
+  if (JSON.stringify(part) !== JSON.stringify([1, 3])) {
+    throw new Error(`0-3 应为 [1,3]，实际 ${JSON.stringify(part)}`);
+  }
+  // 尾部越界 6-1000：只到 7，缺 7
+  const tail = mod.missingBaselineIndexes({ baselineIds: ids, begin: 6, end: 1000 }, seen);
+  if (JSON.stringify(tail) !== JSON.stringify([7])) {
+    throw new Error(`6-1000 应为 [7]，实际 ${JSON.stringify(tail)}`);
+  }
+  // 全部做出来
+  const none = mod.missingBaselineIndexes({ baselineIds: ids, begin: null, end: null }, new Set(ids));
+  if (JSON.stringify(none) !== "[]") throw new Error(`全做出来应为 []，实际 ${JSON.stringify(none)}`);
+  // 非 baseline 运行返回 null
+  const na = mod.missingBaselineIndexes({ begin: 0, end: 3 }, seen);
+  if (na !== null) throw new Error(`非 baseline 应返回 null，实际 ${JSON.stringify(na)}`);
+  return "6 条用例";
 });
 
 const failed = results.filter((r) => !r.ok);
