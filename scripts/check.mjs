@@ -130,6 +130,49 @@ await check("release 有效题数过滤", async () => {
   return "6 条用例";
 });
 
+// ---------------------------------------------------------------------------
+// 回归测试：正确率的分母
+//
+// 踩过的坑：推理模型把 max_tokens 全烧在思考里、正文为空（token_exhaustion）时，
+// 答案行不是 $ERROR$，于是被当成"做错了"进了分母。
+// 实测 deepseek-flash@max 8 题里只答出 1 题（0.9167 分），却显示 11.5%（= 0.9167/8）。
+// 正确口径（用户定义）：正确率 = 做对的题 / **做出来的题**。
+// ---------------------------------------------------------------------------
+const emptyCases = [
+  ["token_exhaustion 行算「没做出来」",
+    '{"choices": [{"index": 0, "turns": [""]}], "total_output_tokens": 32000, "api_info": {"eval_status": "token_exhaustion"}}', true],
+  ["turns 为空数组",
+    '{"choices": [{"index": 0, "turns": []}]}', true],
+  ["choices 直接是空串",
+    '{"choices": [""]}', true],
+  ["正常答案不算空",
+    '{"choices": [{"index": 0, "turns": ["The answer is 42"]}]}', false],
+  ["答案里出现空串片段但整体非空",
+    '{"choices": [{"index": 0, "turns": ["part1", "part2"]}]}', false],
+  ["$ERROR$ 由 errors 统计，不算 empty",
+    '{"choices": [{"index": 0, "turns": ["$ERROR$"]}]}', false],
+];
+
+await check("空答案识别（正确率分母回归）", async () => {
+  const mod = await import(pathToFileURL(resolve(ROOT, "lib/index.js")).href);
+  const bad = [];
+  for (const [label, line, want] of emptyCases) {
+    const got = mod.isEmptyAnswerLine(line);
+    if (got !== want) bad.push(`${label}: got=${got} want=${want}`);
+  }
+  if (bad.length > 0) throw new Error(bad.join(" | "));
+
+  // 端到端口径：8 题、7 题空、1 题 0.9167 → 分母应为 1，正确率 91.7%
+  const answered = 8, errors = 0, empty = 7, judgedCount = 8, sum = 0.916666666666667;
+  const notProduced = errors + empty;
+  const done = Math.max(0, answered - notProduced);
+  const judgedDone = Math.max(0, judgedCount - notProduced);
+  const score = judgedDone > 0 ? (sum / judgedDone) * 100 : null;
+  if (done !== 1) throw new Error(`做出来应为 1，实际 ${done}`);
+  if (Math.round(score * 10) / 10 !== 91.7) throw new Error(`正确率应为 91.7%，实际 ${score}`);
+  return `${emptyCases.length} 条 + 口径 1 条`;
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) {
   console.log(`${r.ok ? "PASS" : "FAIL"}  ${r.name}${r.detail ? ` — ${r.detail}` : ""}`);

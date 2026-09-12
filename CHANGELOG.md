@@ -5,6 +5,19 @@
 
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.2.21] — 2026-09-12
+
+- **修复正确率分母：没做出来的题不再算作"做错"**。推理模型在难题上会把 `max_tokens`
+  全烧在思考里、正文为空（`eval_status=token_exhaustion`），这类答案行**不是**
+  `$ERROR$`，于是被当成"做错了"进了分母。实测 `deepseek-flash@max` 8 题里只答出 1 题
+  （0.9167 分）却显示 **11.5%**（= 0.9167/8）；按「做对的题 / 做出来的题」应为 **91.7%**。
+  现在答案行分三类：正常 / `$ERROR$`（API 失败）/ 空答案（token 耗尽、正文为空），
+  后两类都从分母剔除，并在 tooltip 里分别标注。
+- **max-tokens 上限 32768 → 200000**。olympiad 这类题的参考模型实测输出普遍在
+  27k–30.6k，8 道"错题"全部是撞到 32768 上限后正文为空——也就是说旧上限会让
+  "能力不够"和"预算不够"混在一起。
+- 新增回归测试：空答案识别 6 条 + 正确率口径 1 条（`node scripts/check.mjs`）。
+
 ## [0.2.20] — 2026-09-12
 
 - **新增 Baseline 题库（探针）**：位于「分类 / 任务」之上的独立条目，三层可选 ——
@@ -72,6 +85,7 @@
   - 正在评测中的模型会被跳过，并在响应 `skipped` 中返回，前端弹窗提示。
 - 顺带清理了数据目录中 67 个 0 字节 `*.jsonl`。
 
+[0.2.21]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.20...v0.2.21
 [0.2.20]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.18...v0.2.20
 [0.2.18]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.17...v0.2.18
 [0.2.17]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.16...v0.2.17
