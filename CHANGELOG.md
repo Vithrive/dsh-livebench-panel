@@ -5,6 +5,26 @@
 
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.2.24] — 2026-09-19
+
+- **修复「dsh web 从 conda 已激活的终端启动时，评测必然失败」**。现场：
+  ```
+  'source' is not recognized as an internal or external command
+  Activating virtual environment: D:\ProgramData\Anaconda3\envs\mineru\bin\activate
+  ModuleNotFoundError: No module named 'shortuuid'
+  ```
+  三个缺陷叠加：
+  1. 插件把 `dsh web` 进程继承来的 `VIRTUAL_ENV`（此处是 conda 的 `mineru` 环境）原样传给 `run_livebench.py`；
+  2. LiveBench 的 `detect_active_venv()` 读 `VIRTUAL_ENV` 后一律拼成 `<venv>/bin/activate`
+     （Unix 路径），再执行 `source ...` —— Windows 上必然失败；
+  3. 更致命的是它随后用**写死的 `:`** 拼 PATH，把插件刚前置好的 venv `Scripts` 条目和下一段
+     粘成无效路径 `D:\...\mineru\bin:C:\WINDOWS\system32`，等于把 venv 解释器从 PATH 里删掉，
+     后面裸调的 `python` 就回退到 conda 解释器（缺 LiveBench 依赖）。
+
+  面板侧现在会从子进程环境里删掉 `VIRTUAL_ENV` / `CONDA_PREFIX` / `CONDA_DEFAULT_ENV`
+  （它自己已经把正确的 venv 放在 PATH 最前，不需要任何 activate）；
+  LiveBench 侧见 [docs/livebench-patches.md](docs/livebench-patches.md)。
+
 ## [0.2.23] — 2026-09-12
 
 - **修复「空字符串范围被当成 0..0」**：面板表单没填起止时提交的是 `""` 而不是 `null`，
@@ -107,6 +127,7 @@
   - 正在评测中的模型会被跳过，并在响应 `skipped` 中返回，前端弹窗提示。
 - 顺带清理了数据目录中 67 个 0 字节 `*.jsonl`。
 
+[0.2.24]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.23...v0.2.24
 [0.2.23]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.22...v0.2.23
 [0.2.22]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.21...v0.2.22
 [0.2.21]: https://github.com/Vithrive/dsh-livebench-panel/compare/v0.2.20...v0.2.21
