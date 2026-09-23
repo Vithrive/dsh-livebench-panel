@@ -86,7 +86,7 @@ cd livebench
 - **推理强度下拉框**（模型右侧）：来自模型配置的 `reasoningEfforts` 映射（如 gpt-5.6 系 off/low/medium/high/xhigh/max，DeepSeek off/low/high/max）。选定后：
   - 插件向 `livebench/model/model_configs/dsh_panel_generated__<display-name>.yaml` 写入一条模型配置（每个模型一个文件，避免并发写同名文件互相覆盖），经 LiveBench 的 `api_kwargs.default.reasoning_effort` 透传给 API（`off` 表示不透传、由后端走默认）；
   - 强度编码进 display-name（如 `code-gpt__gpt-5.6-sol@high`），**不同强度在成绩表中是独立条目**，可直接对比。
-- **参数下拉框**：题集 release（LiveBench 全部 releases）、分类（coding/math/reasoning/language/data_analysis/instruction_following）、任务（随分类联动）、题目序号范围、max-tokens。
+- **参数下拉框**：题集 release（LiveBench 全部 releases）、分类（coding/math/reasoning/language/data_analysis/instruction_following）、任务（随分类联动）、题目序号范围、max-tokens（**默认 32000**，自动夹到模型声明的上限；LiveBench 自带默认只有 4096，推理模型会思考吃满、正文为空，难题可手动调到 65536）、**并发请求数**（`--parallel-requests`，1/2/3/4/6/8，默认 1=串行；模型单题思考慢时并发多题是唯一能等比缩短总时长的开关）。
 - **协议路由**：**Anthropic/Claude 系模型一律走 `anthropic-messages`**（POST `<baseURL>/v1/messages`，
   与会话窗口同协议；`baseURL` 会自动剥掉 `/v1`、`/v1/messages` 后缀，因为 anthropic SDK 自己会拼）；
   其余模型按 settings.yaml 的 `api` 走 `openai-completions` / `openai-responses` / 内置端点。
@@ -100,6 +100,9 @@ cd livebench
   默认 600s 无字节才断开重试（可用渠道声明的 `streamIdleTimeoutMs` 覆写）；
   另有两道硬边界——单次请求总时长上限（`LIVEBENCH_STREAM_MAX_SECONDS`，默认 1800s）
   与首个字节等待上限（`LIVEBENCH_FIRST_BYTE_TIMEOUT`，默认 600s）。
+- **进度心跳**：模型长时间思考时网关只发 `ping`、正文迟迟不来，日志里会每 30 秒出现一行
+  `仍在接收: 已 120s，连接累计 12345 字节（模型思考中，正文未到）`，长思考不会"看起来卡死"
+  （`LIVEBENCH_PROGRESS_SECONDS`，0 = 关闭）。
 - **运行控制**：开始 / 停止 / 刷新；最多 9 个模型并发评测（每个模型同时只跑 1 次）；实时滚动日志（每 2.5s 轮询）；「刷新」会清掉已结束的运行日志。
 - **自动补跑（API 抖动兜底）**：一次评测要连续打几百次 API，中转站 502/限流/超时是常态。
   跑完后若答案文件里还有 `$ERROR$`，面板会自动用 `--resume --retry-failures`
