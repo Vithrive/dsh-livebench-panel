@@ -46,7 +46,7 @@ cd livebench
 | 分类 | 六大类：coding / math / reasoning / language / data_analysis / instruction_following | 首次验证选 `language` |
 | 任务 | 分类下的具体任务（如 language/typos 拼写纠错） | 首次验证选 `typos`（短平快） |
 | 题目序号范围 | 起止下标（0 起，**含首尾**）；选 Baseline 时序号相对该题库 | 冒烟测试填 0–1（只跑 2 题） |
-| max-tokens | 单次回答的 token 上限 | 推理模型给 8192+，否则思考被截断判 0 分 |
+| max-tokens | 单次回答的 token 上限（默认 65536，上限 200000） | 推理模型别低于 32768，否则思考吃满预算、正文为空，这题会被记成「没做出来」 |
 
 ## Baseline 题库（探针）
 
@@ -87,8 +87,31 @@ cd livebench
   - 插件向 `livebench/model/model_configs/dsh_panel_generated__<display-name>.yaml` 写入一条模型配置（每个模型一个文件，避免并发写同名文件互相覆盖），经 LiveBench 的 `api_kwargs.default.reasoning_effort` 透传给 API（`off` 表示不透传、由后端走默认）；
   - 强度编码进 display-name（如 `code-gpt__gpt-5.6-sol@high`），**不同强度在成绩表中是独立条目**，可直接对比。
 - **参数下拉框**：题集 release（LiveBench 全部 releases）、分类（coding/math/reasoning/language/data_analysis/instruction_following）、任务（随分类联动）、题目序号范围、max-tokens。
+- **协议路由**：**Anthropic/Claude 系模型一律走 `anthropic-messages`**（POST `<baseURL>/v1/messages`，
+  与会话窗口同协议；`baseURL` 会自动剥掉 `/v1`、`/v1/messages` 后缀，因为 anthropic SDK 自己会拼）；
+  其余模型按 settings.yaml 的 `api` 走 `openai-completions` / `openai-responses` / 内置端点。
+  运行日志首行打印 `[route] …`，写明协议、目标地址、`max_tokens` 与 thinking 形状。
+- **请求形状对齐会话窗口**：anthropic 通道按强度档附上
+  `thinking: {type: enabled, budget_tokens: N}`（minimal 1024 / low 2048 / medium 8192 /
+  high·xhigh·max 16384；`off` → `{type: disabled}`），并因此**不发 `temperature`**；
+  非 anthropic 通道按渠道习惯选长度上限字段（aiportx 这类中转用 `max_completion_tokens`），
+  且 `--max-tokens` 会夹到该模型在 settings.yaml 里声明的上限。
+- **流式看门狗不会误杀健康请求**：判活标准是"连接上是否还有字节"（含网关每 3 秒的 `ping`），
+  默认 600s 无字节才断开重试（可用渠道声明的 `streamIdleTimeoutMs` 覆写）；
+  另有两道硬边界——单次请求总时长上限（`LIVEBENCH_STREAM_MAX_SECONDS`，默认 1800s）
+  与首个字节等待上限（`LIVEBENCH_FIRST_BYTE_TIMEOUT`，默认 600s）。
 - **运行控制**：开始 / 停止 / 刷新；最多 9 个模型并发评测（每个模型同时只跑 1 次）；实时滚动日志（每 2.5s 轮询）；「刷新」会清掉已结束的运行日志。
-- **成绩表**：直接读取 `data/live_bench/**/model_judgment/ground_truth_judgment.jsonl` 计算 模型 × 任务 平均分（分数 = 正确率 ×100，单元格下方括号标注「**本次没做或没做完的题数 / 用户选择的题数**」，即题目序号范围的题数；不参与正确率计算的总题数不展示），无需等 LiveBench 自己出榜。支持按模型名/时间排序、拖 ⠿ 自定义行序、勾选或单行按钮删除成绩（删除会同时清掉该模型的答案与判分行；只有空壳文件的“幽灵行”不会再被扫描出来，删除结果稳定持久）。
+- **自动补跑（API 抖动兜底）**：一次评测要连续打几百次 API，中转站 502/限流/超时是常态。
+  跑完后若答案文件里还有 `$ERROR$`，面板会自动用 `--resume --retry-failures`
+  **只重跑失败的那几题**（最多 3 轮，间隔 15s / 60s / 3min），并复用同一个条目名 ——
+  已成功题目的答案与判分都保留，成绩表里仍然只有一行。Baseline 评测同样适用。
+  日志里会打印 `[自动补跑] …`。
+  注意：思考吃满 max-tokens 的空答案（不是 `$ERROR$`）不会自动补跑——那不是抖动，
+  把 max-tokens 调大后手动重跑才有意义。
+- **题目数据集离线读取**：huggingface.co 在国内常常连不通，而已缓存的分类根本不需要联网。
+  面板检测到本次要跑的分类都在 `.hf_cache` 里时，直接以 `HF_HUB_OFFLINE=1` 启动，
+  省掉 5 轮 HEAD 超时重试（每次白等 20~60s）；缺缓存的分类保持联网，不影响新 release。
+- **成绩表**：直接读取 `data/live_bench/**/model_judgment/ground_truth_judgment.jsonl` 计算 模型 × 任务 平均分（分数 = 正确率 ×100，单元格下方括号标注「**本次没做或没做完的题数 / 用户选择的题数**」，即题目序号范围的题数；不参与正确率计算的总题数不展示），无需等 LiveBench 自己出榜。**判分与答案按 `answer_id` 配对**：补跑换过答案的题只认新判分，旧的 0 分不会把成绩拉低；答案文件里同一题出现多行时按最后一行取值（与 LiveBench 自身口径一致）。支持按模型名/时间排序、拖 ⠿ 自定义行序、勾选或单行按钮删除成绩（删除会同时清掉该模型的答案与判分行；只有空壳文件的“幽灵行”不会再被扫描出来，删除结果稳定持久）。
 - **题目序号范围按闭区间处理**：LiveBench 的 `--question-end` 是开区间（`questions[begin:end]`），面板按用户直觉采用闭区间（传参时 `止 + 1`），因此界面上填的题数与实际跑的题数一致。
 
 ## 依赖

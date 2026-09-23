@@ -89,6 +89,99 @@ openai.BadRequestError:    400 field Temperature invalid, only 1 is allowed for 
 `temperature` / `top_p` / `reasoning_effort` / `thinking` / `max_tokens` 都适用，
 anthropic / openai / openai_responses / URL provider 全部接入。
 
+### 2) 请求形状降级阶梯（参数拒绝被伪装成 5xx 时兜底）
+
+现场（aiportx 中转 + kimi-k3，2026-09-19）：请求带 `temperature: 0` 时网关**不返回 400**，
+而是回
+
+```
+502 {'error': {'message': 'Upstream service temporarily unavailable'}}
+```
+
+参数兼容层只认 400/422 里点名的参数，这种"伪装成 5xx 的参数拒绝"永远学不会 ——
+8 道题各自退避重试 5 次全部 502，整场评测白跑 35 分钟。逐项消融实测：
+`temp=0` → 502；`temp=0` 去掉 `stream_options` → 502；`temp=1` → **OK 16.9s**；
+不传 `temp` → **OK 7.0s**；`temp=0` 换 `max_tokens`/`reasoning_effort`/真题 prompt → 仍 502。
+
+降级逻辑：**连续 2 次同形状的号池/5xx** 之后（参数形状不对时等 220s 退避毫无意义），
+按阶梯逐档换形状各试一次：
+
+1. `temperature` 0 → 1；
+2. 不传 `temperature`；
+3. 再去掉 `stream_options.include_usage`；
+4. 再去掉 `model_api_kwargs`（`reasoning_effort` 等厂商私有参数）。
+
+成功的那一档记进 `_LEARNED_SHAPES[上游|模型]`（**模块级**，不能放 `_resilient` 闭包里 ——
+`gen_api_answer` 每次调用都重新包一层，闭包里的记忆活不过一次请求），
+本次进程后续请求直接用对的形状。所有形状都失败仍记 `$ERROR$`，不会无限重试。
+
+### 3) 流式静默看门狗（连接开着但一个字节都不给）
+
+现场（code28.ccwu.cc + claude-fable-5-1，2026-09-22）：网关**接了请求、TCP 连接一直
+ESTABLISHED、keep-alive 还在滴，但一个 SSE 事件都不发**。实测对比（同一题面）：
+
+| 请求 | 结果 |
+|---|---|
+| 简单 prompt（4 种参数组合） | OK 4~6s |
+| 真题题面 4364 字符，`mt=65536` | 首事件 5.8s，之后 **60s+ 零事件、正文 0 字符** |
+| 真题题面，`mt=8192` / `mt=1024` | 同样静默（或 526 个事件全是思考、正文 0 字符） |
+| 长英文 prompt 1400 词 | OK 71.6s（4699 事件、7823 字符） |
+
+即：**内容相关的上游静默**。而 httpx 的 read 超时是按"两次读之间的间隔"算的，
+keep-alive 让它在 1800s 内永不触发；Anthropic SDK 的默认 600s 超时同样拦不住 ——
+面板里就表现为**完全没有动静**（一道题静默十几分钟，日志一个字都没有）。
+
+现在两条流式通道都挂了 `_IdleStreamGuard`：按"多久没收到事件"独立计时，
+超过 `LIVEBENCH_STREAM_IDLE_TIMEOUT` 就主动关流，日志写明
+
+```
+[dsh-livebench-panel] chat_completion_anthropic 上游 600s 没有任何输出（连接还开着，疑似被挂住）→ 主动断开，交给容错层重试: <模型>
+```
+
+随后抛出的 `TimeoutError: upstream stalled: no chunk for Ns (stream idle timeout)`
+落在瞬态错误里，由容错层退避重试；重试仍不行就按老规矩记 `$ERROR$`
+（面板口径：**没做出来**，不进正确率分母）。Anthropic 通道另给了显式
+`httpx.Timeout(1800, connect=15)` 与 `max_retries=0`（重试统一交给容错层，日志才看得见）。
+
+### 4) 静默阈值必须按渠道定，不能一刀切压小（实测 regression）
+
+阈值最初写死 120s，结果把 **aiportx-claude 的正常长思考**当成"挂住"：
+
+| 实测 | 结果 |
+|---|---|
+| aiportx-claude 答一道 olympiad（09-12 记录，当时没有看门狗） | **139~286s/题**，输出 1~2 万 token |
+| 同一题的无看门狗长测 | 首 chunk 3.9s → **172.4s 空档** → 之后继续出块（空档是常态，不是挂住） |
+| 阈值 120s 时的一次真实评测 | 一题被掐 5 次（120s×N + 退避 + 形状阶梯 ≈ 874s），最后记 `$ERROR$` |
+
+所以现在的规则是：**默认 600s**，并且面板把 harness 在 settings.yaml 里为该渠道声明的
+`streamIdleTimeoutMs` 透进来（`code-claude = 120000` → 120s，那个渠道确实是"接了请求就不回"）。
+两个渠道各用合适的阈值，而不是一刀切。环境变量 `LIVEBENCH_STREAM_IDLE_TIMEOUT`
+可以再覆盖（0 = 关闭）。
+
+### 5) 输出上限的字段名：`max_tokens` vs `max_completion_tokens`（面板侧修，2026-09-23）
+
+现场：`aiportx-claude/claude-fable-5-1@max` 在会话窗口里很快，一进 LiveBench 就"卡死"。
+
+会话窗口走 pi-ai，会按渠道自动挑字段（`@earendil-works/pi-ai/dist/api/openai-completions.js`
+里的 `detectCompat().maxTokensField`）：
+
+- **`max_completion_tokens`**：aiportx / code28 这类中转（不在 useMaxTokens 名单里）；
+- **`max_tokens`**：deepseek / moonshot / z.ai / together / nvidia / ant-ling / chutes / Cloudflare 网关。
+
+而 LiveBench 的 `chat_completion_openai` 只看模型名里有没有 `"gpt"`，非 gpt 一律发 `max_tokens`。
+同一道 olympiad、同一 `reasoning_effort=max`，只换字段名：
+
+| 字段 | 结果 |
+|---|---|
+| `max_completion_tokens=64000` | **224s 跑完**（1263 chunk、6297 字符，最大空档 106s） |
+| `max_tokens=64000` | 首块 3.8s、276 chunk 后 **172.7s 零 chunk**；无看门狗长测 **1232s** 才结束、最大空档 **449s** |
+
+修法：**面板**在生成的模型配置里写死字段（`api_kwargs.default.max_completion_tokens: <上限>`）——
+LiveBench 的 `if 'max_tokens' not in api_kwargs and 'max_completion_tokens' not in api_kwargs`
+分支因此被跳过，字段名不再靠猜。判定规则与 pi-ai 一致（`maxTokensFieldFor`），
+并尊重 settings.yaml 里显式写的 `compat.maxTokensField`；只有 harness 真会用
+`max_completion_tokens` 的渠道才写。
+
 ## 回归自测
 
 参数兼容层的归因逻辑有独立自测（14 条用例：真实现场文案、401/429/500 不该触发、
@@ -97,7 +190,7 @@ anthropic / openai / openai_responses / URL provider 全部接入。
 ```bat
 cd /d <LiveBench 根目录>
 .venv\Scripts\python param_compat_selftest.py     :: 参数归因逻辑（16 条用例）
-.venv\Scripts\python resilience_matrix_test.py    :: 故障矩阵（25 个场景）
+.venv\Scripts\python resilience_matrix_test.py    :: 故障矩阵（29 个场景）
 ```
 
 `resilience_matrix_test.py` 用假客户端把"上游可能怎么坏"逐条演一遍（不联网、不消耗额度）：
